@@ -100,64 +100,94 @@ function set_autoexpand() {
 
 cat <<'EOFRC' > "$mountdir/etc/rc.local"
 #!/bin/bash
-## PiShrink https://github.com/Drewsif/PiShrink ##
-do_expand_rootfs() {
-  ROOT_PART=$(mount | sed -n 's|^/dev/\(.*\) on / .*|\1|p')
+# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-  PART_NUM=${ROOT_PART#mmcblk0p}
-  if [ "$PART_NUM" = "$ROOT_PART" ]; then
-    echo "$ROOT_PART is not an SD card. Don't know how to expand"
-    return 0
-  fi
+# This is a script to resize partition and filesystem on the root partition
+# This will consume all un-allocated sapce on SD card after boot.
 
-  # Get the starting offset of the root partition
-  PART_START=$(parted /dev/mmcblk0 -ms unit s p | grep "^${PART_NUM}" | cut -f 2 -d: | sed 's/[^0-9]//g')
-  [ "$PART_START" ] || return 1
-  # Return value will likely be error for fdisk as it fails to reload the
-  # partition table because the root fs is mounted
-  fdisk /dev/mmcblk0 <<EOF
-p
-d
-$PART_NUM
-n
-p
-$PART_NUM
-$PART_START
+set -e
 
-p
-w
-EOF
+# 檢查是否在 Jetson Nano 上運行
+if [ -e "/proc/device-tree/compatible" ]; then
+	model="$(tr -d '\0' < /proc/device-tree/compatible)"
+	if [[ "${model}" =~ "jetson-nano" ]]; then
+		model="jetson-nano"
+	fi
+fi
 
-cat <<EOF > /etc/rc.local &&
-#!/bin/sh
-echo "Expanding /dev/$ROOT_PART"
-resize2fs /dev/$ROOT_PART
-rm -f /etc/rc.local; cp -fp /etc/rc.local.bak /etc/rc.local && /etc/rc.local
+if [ "${model}" != "jetson-nano" ]; then
+	echo "Not a Jetson Nano, skipping resize."
+	# 恢復 rc.local 並退出
+	if [ -f /etc/rc.local.bak ]; then mv /etc/rc.local.bak /etc/rc.local; fi
+	exit 0
+fi
 
-EOF
-reboot
-exit
-}
-raspi_config_expand() {
-/usr/bin/env raspi-config --expand-rootfs
-if [[ $? != 0 ]]; then
-  return -1
+echo "Starting NVIDIA partition resize process..."
+
+# 步驟 1: 將備份 GPT 頭移動到磁碟末尾
+echo "Moving backup GPT header to the end of the disk..."
+sgdisk --move-second-header /dev/mmcblk0
+
+# 步驟 2: 備份根分區 (APP, No. 1) 的重要元數據
+echo "Backing up partition metadata..."
+partition_name="$(sgdisk -i 1 /dev/mmcblk0 | grep "Partition name" | cut -d\' -f2)"
+partition_type="$(sgdisk -i 1 /dev/mmcblk0 | grep "Partition GUID code:" | cut -d' ' -f4)"
+partition_uuid="$(sgdisk -i 1 /dev/mmcblk0 | grep "Partition unique GUID:" | cut -d' ' -f4)"
+start_sector="$(cat /sys/block/mmcblk0/mmcblk0p1/start)"
+
+# 步驟 3: 刪除並以最大尺寸重建根分區，同時恢復所有元數據
+echo "Re-creating partition 1 to fill available space..."
+sgdisk -d 1 -n 1:"${start_sector}":0 -c 1:"${partition_name}" \
+	-t 1:"${partition_type}" -u 1:"${partition_uuid}" /dev/mmcblk0
+
+# 步驟 4: 通知核心分區表已變更
+echo "Informing kernel about partition changes..."
+partprobe /dev/mmcblk0
+
+# 步驟 5: 擴展 ext4 檔案系統
+echo "Resizing filesystem..."
+resize2fs /dev/mmcblk0p1
+
+echo "Partition and filesystem resize successful!"
+
+# --- 自我銷毀機制 ---
+echo "Cleaning up rc.local to prevent re-execution..."
+if [ -f /etc/rc.local.bak ]; then
+    mv /etc/rc.local.bak /etc/rc.local
 else
-  rm -f /etc/rc.local; cp -fp /etc/rc.local.bak /etc/rc.local && /etc/rc.local
-  reboot
-  exit
+    echo "#!/bin/sh -e" > /etc/rc.local
+    echo "exit 0" >> /etc/rc.local
+    chmod +x /etc/rc.local
 fi
-}
-raspi_config_expand
-echo "WARNING: Using backup expand..."
-sleep 5
-do_expand_rootfs
-echo "ERROR: Expanding failed..."
-sleep 5
-if [[ -f /etc/rc.local.bak ]]; then
-  cp -fp /etc/rc.local.bak /etc/rc.local
-  /etc/rc.local
-fi
+
+# echo "擴展完成，系統將重新啟動..."
+sleep 1
+reboot
+
 exit 0
 EOFRC
 
